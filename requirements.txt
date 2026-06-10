@@ -1,0 +1,4 @@
+huggingface_hub>=0.27.0
+pyyaml>=6.0
+tenacity>=8.0
+python-dotenv>=1.0
