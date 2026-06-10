@@ -1,20 +1,3 @@
-"""CLI entry point for a single model x single prompt benchmark run.
-
-Inference is serverless via the Hugging Face Inference Providers API, so a
-valid HF token (with Inference permission) is required.
-
-Usage
------
-    python run_benchmark.py --model qwen2.5_7b --prompt-id smoke_test
-    python run_benchmark.py --model qwen3_8b --prompt-id custom \\
-        --prompt-text "Why is the sky blue?"
-    # A raw HF repo id works too (anything containing "/"):
-    python run_benchmark.py --model Qwen/Qwen2.5-7B-Instruct --prompt-id smoke_test
-
-The token is read from --token, else a local .env file (HF_TOKEN=...), else
-$HF_TOKEN, else $HUGGINGFACEHUB_API_TOKEN.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -24,21 +7,15 @@ import time
 from typing import Optional
 
 from runner import db as db_module
+from runner import scorer as scorer_module
 from runner.executor import run_prompt
+from runner.prompts import load_prompts
 
 
-# Built-in model registry: friendly key -> (hf_id, size_b in billions). Day 1
-# ships the five target models; Day 2+ will load this from models.yaml. A
-# ``--model`` value containing "/" is treated as a raw HF repo id instead.
-# All verified live on HF Inference Providers via pay-as-you-go providers
-# (Together / Nscale / Novita / Groq / Scaleway) — NOT Featherless, which is
-# subscription-only and unavailable through HF routed billing.
 BUILTIN_MODELS: dict[str, dict[str, object]] = {
-    # gated models (accept the license on the HF model page first):
     "llama3.1_8b": {"hf_id": "meta-llama/Llama-3.1-8B-Instruct", "size_b": 8.0},
     "gemma3_27b": {"hf_id": "google/gemma-3-27b-it", "size_b": 27.0},
     "llama3.3_70b": {"hf_id": "meta-llama/Llama-3.3-70B-Instruct", "size_b": 70.0},
-    # ungated:
     "qwen2.5_7b": {"hf_id": "Qwen/Qwen2.5-7B-Instruct", "size_b": 7.6},
     "qwen3_8b": {"hf_id": "Qwen/Qwen3-8B", "size_b": 8.2},
     "qwen3_14b": {"hf_id": "Qwen/Qwen3-14B", "size_b": 14.8},
@@ -51,8 +28,6 @@ BUILTIN_MODELS: dict[str, dict[str, object]] = {
 }
 
 
-# Built-in prompts available without --prompt-text. Day 1 keeps this tiny;
-# Day 2+ will load a real prompt set from prompts/*.yaml.
 BUILTIN_PROMPTS: dict[str, dict[str, str]] = {
     "smoke_test": {
         "category": "smoke",
@@ -81,13 +56,30 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--prompt-id",
-        required=True,
-        help="Prompt identifier. Use 'smoke_test' for the built-in Day 1 prompt.",
+        default=None,
+        help=(
+            "Prompt identifier for a single run. Use 'smoke_test' for the "
+            "built-in Day 1 prompt, or an id from a prompts/*.json file. "
+            "Mutually exclusive with --suite."
+        ),
     )
     p.add_argument(
         "--prompt-text",
         default=None,
         help="Override prompt text. Required if --prompt-id is not a built-in.",
+    )
+    p.add_argument(
+        "--suite",
+        action="store_true",
+        help=(
+            "Run every prompt loaded from --prompts-dir against the model and "
+            "score each result. Mutually exclusive with --prompt-id."
+        ),
+    )
+    p.add_argument(
+        "--prompts-dir",
+        default="prompts",
+        help="Directory of prompts/*.json files for --suite (default: prompts).",
     )
     p.add_argument(
         "--token",
@@ -117,11 +109,6 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
 
 def _resolve_model(model: str) -> dict[str, object]:
-    """Resolve a --model value to {name, hf_id, size_b}.
-
-    A value containing "/" is treated as a raw HF repo id (name == hf_id,
-    size unknown). Otherwise it must be a known built-in key.
-    """
     if "/" in model:
         return {"name": model, "hf_id": model, "size_b": None}
     builtin = BUILTIN_MODELS.get(model)
@@ -133,53 +120,154 @@ def _resolve_model(model: str) -> dict[str, object]:
     return {"name": model, "hf_id": builtin["hf_id"], "size_b": builtin["size_b"]}
 
 
-def _resolve_prompt(prompt_id: str, prompt_text: Optional[str]) -> dict[str, str]:
-    """Pick the prompt definition, preferring --prompt-text override."""
+def _resolve_prompt(
+    prompt_id: str,
+    prompt_text: Optional[str],
+    prompts_dir: str = "prompts",
+) -> dict[str, object]:
     builtin = BUILTIN_PROMPTS.get(prompt_id)
     if prompt_text is not None:
         return {
+            "id": prompt_id,
             "category": (builtin or {}).get("category", "custom"),
             "input": prompt_text,
             "expected_output": (builtin or {}).get("expected_output", ""),
             "scoring_method": (builtin or {}).get("scoring_method", "manual"),
+            "scoring_args": (builtin or {}).get("scoring_args", {}),
         }
-    if builtin is None:
-        raise SystemExit(
-            f"Unknown prompt-id {prompt_id!r} and no --prompt-text provided. "
-            f"Known built-ins: {sorted(BUILTIN_PROMPTS)}"
-        )
-    return builtin
+    if builtin is not None:
+        return {
+            "id": prompt_id,
+            "scoring_args": {},
+            **builtin,
+        }
+
+    try:
+        loaded = {p["id"]: p for p in load_prompts(prompts_dir)}
+    except Exception as exc:
+        raise SystemExit(f"Failed to load prompts from {prompts_dir!r}: {exc}")
+    if prompt_id in loaded:
+        return loaded[prompt_id]
+
+    raise SystemExit(
+        f"Unknown prompt-id {prompt_id!r} and no --prompt-text provided. "
+        f"Known built-ins: {sorted(BUILTIN_PROMPTS)}; "
+        f"loaded ids: {sorted(loaded)}"
+    )
 
 
 def _load_dotenv_if_available() -> None:
-    """Load a local .env into os.environ if python-dotenv is installed.
-
-    Optional by design: the package may not be present (e.g. in the sandbox
-    verify path), so a missing import is silently ignored. Existing
-    environment variables are NOT overridden.
-    """
     try:
-        from dotenv import load_dotenv  # type: ignore
+        from dotenv import load_dotenv
     except ImportError:
         return
     load_dotenv(override=False)
 
 
 def _resolve_token(token_arg: Optional[str]) -> Optional[str]:
-    """Resolve the HF token from --token, then a .env file, then env vars."""
     if token_arg:
         return token_arg
     _load_dotenv_if_available()
+    return os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACEHUB_API_TOKEN")
+
+
+def _score_run(prompt_def: dict[str, object], raw_output: str) -> Optional[float]:
+    method = str(prompt_def.get("scoring_method") or "manual")
+    if method in scorer_module.MANUAL_METHODS:
+        return None
+    cleaned = scorer_module.strip_reasoning(raw_output)
+    return scorer_module.score(cleaned, prompt_def)
+
+
+def _run_one(
+    conn: object,
+    model_id: int,
+    model_def: dict[str, object],
+    prompt_def: dict[str, object],
+    token: str,
+    max_tokens: int,
+    force: bool,
+) -> tuple[str, str]:
+    prompt_id = str(prompt_def["id"])
+    db_module.upsert_prompt(
+        conn,
+        prompt_id=prompt_id,
+        category=str(prompt_def.get("category", "")),
+        input_text=str(prompt_def.get("input", "")),
+        expected_output=str(prompt_def.get("expected_output", "")),
+        scoring_method=str(prompt_def.get("scoring_method", "manual")),
+    )
+
+    if not force and db_module.run_exists(conn, model_id, prompt_id):
+        return "skip", f"{model_def['name']} x {prompt_id} already in DB (use --force)."
+
+    try:
+        result = run_prompt(
+            str(model_def["hf_id"]),
+            str(prompt_def["input"]),
+            token=token,
+            max_tokens=max_tokens,
+        )
+    except ImportError:
+        raise
+    except Exception as exc:
+        return "error", f"{prompt_id}: inference call failed: {exc}"
+
+    score_value = _score_run(prompt_def, result["output"])
+
+    run_id = db_module.insert_run(
+        conn,
+        model_id=model_id,
+        prompt_id=prompt_id,
+        output=result["output"],
+        latency_ms=result["latency_ms"],
+        ttft_ms=result["ttft_ms"],
+        tokens_per_sec=result["tokens_per_sec"],
+        ts=int(time.time()),
+        quality_score=score_value,
+    )
+
+    preview = result["output"].strip().replace("\n", " ")
+    if len(preview) > 80:
+        preview = preview[:77] + "..."
+    ttft = result["ttft_ms"]
+    ttft_str = f"{ttft}ms" if ttft is not None else "n/a"
+    score_str = "n/a" if score_value is None else f"{score_value:.2f}"
     return (
-        os.environ.get("HF_TOKEN")
-        or os.environ.get("HUGGINGFACEHUB_API_TOKEN")
+        "ok",
+        f"run_id={run_id} model={model_def['name']} prompt={prompt_id} "
+        f"score={score_str} latency={result['latency_ms']}ms ttft={ttft_str} "
+        f"tok/s={result['tokens_per_sec']:.2f} :: {preview!r}",
     )
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = _parse_args(argv)
+
+    if args.suite and args.prompt_id:
+        print(
+            "[error] --suite and --prompt-id are mutually exclusive.", file=sys.stderr
+        )
+        return 1
+    if not args.suite and not args.prompt_id:
+        print("[error] provide --prompt-id <id> or --suite.", file=sys.stderr)
+        return 1
+
     model_def = _resolve_model(args.model)
-    prompt_def = _resolve_prompt(args.prompt_id, args.prompt_text)
+
+    if args.suite:
+        try:
+            prompt_defs = load_prompts(args.prompts_dir)
+        except Exception as exc:
+            print(f"[error] failed to load prompts: {exc}", file=sys.stderr)
+            return 1
+        if not prompt_defs:
+            print(f"[error] no prompts found in {args.prompts_dir!r}.", file=sys.stderr)
+            return 1
+    else:
+        prompt_defs = [
+            _resolve_prompt(args.prompt_id, args.prompt_text, args.prompts_dir)
+        ]
 
     token = _resolve_token(args.token)
     if not token:
@@ -192,72 +280,49 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         return 1
 
+    n_ok = n_skip = n_err = 0
     with db_module.open_db(args.db_path) as conn:
         model_id = db_module.upsert_model(
             conn,
             name=str(model_def["name"]),
             hf_id=str(model_def["hf_id"]),
-            size_b=model_def["size_b"],  # type: ignore[arg-type]
-        )
-        db_module.upsert_prompt(
-            conn,
-            prompt_id=args.prompt_id,
-            category=prompt_def["category"],
-            input_text=prompt_def["input"],
-            expected_output=prompt_def["expected_output"],
-            scoring_method=prompt_def["scoring_method"],
+            size_b=model_def["size_b"],
         )
 
-        if not args.force and db_module.run_exists(conn, model_id, args.prompt_id):
-            print(
-                f"[skip] {args.model} x {args.prompt_id} already in DB. "
-                f"Use --force to re-run."
-            )
-            return 0
+        for prompt_def in prompt_defs:
+            try:
+                status, message = _run_one(
+                    conn,
+                    model_id=model_id,
+                    model_def=model_def,
+                    prompt_def=prompt_def,
+                    token=token,
+                    max_tokens=args.max_tokens,
+                    force=args.force,
+                )
+            except ImportError as exc:
+                print(
+                    "[error] The 'huggingface_hub' package is not installed. "
+                    "Run: pip install -r requirements.txt",
+                    file=sys.stderr,
+                )
+                print(f"        ({exc})", file=sys.stderr)
+                return 2
 
-        try:
-            result = run_prompt(
-                str(model_def["hf_id"]),
-                prompt_def["input"],
-                token=token,
-                max_tokens=args.max_tokens,
-            )
-        except ImportError as exc:
-            print(
-                "[error] The 'huggingface_hub' package is not installed. "
-                "Run: pip install -r requirements.txt",
-                file=sys.stderr,
-            )
-            print(f"        ({exc})", file=sys.stderr)
-            return 2
-        except Exception as exc:  # noqa: BLE001 — top-level CLI boundary
-            print(f"[error] inference call failed: {exc}", file=sys.stderr)
-            return 1
+            if status == "ok":
+                n_ok += 1
+                print(f"[ok] {message}")
+            elif status == "skip":
+                n_skip += 1
+                print(f"[skip] {message}")
+            else:
+                n_err += 1
+                print(f"[error] {message}", file=sys.stderr)
 
-        run_id = db_module.insert_run(
-            conn,
-            model_id=model_id,
-            prompt_id=args.prompt_id,
-            output=result["output"],
-            latency_ms=result["latency_ms"],
-            ttft_ms=result["ttft_ms"],
-            tokens_per_sec=result["tokens_per_sec"],
-            ts=int(time.time()),
-            quality_score=None,  # Day 2 will fill this in.
-        )
+    if args.suite:
+        print(f"[done] suite: {n_ok} ok, {n_skip} skipped, {n_err} errors.")
 
-    preview = result["output"].strip().replace("\n", " ")
-    if len(preview) > 80:
-        preview = preview[:77] + "..."
-    ttft = result["ttft_ms"]
-    ttft_str = f"{ttft}ms" if ttft is not None else "n/a"
-    print(
-        f"[ok] run_id={run_id} model={args.model} prompt={args.prompt_id} "
-        f"latency={result['latency_ms']}ms "
-        f"ttft={ttft_str} "
-        f"tok/s={result['tokens_per_sec']:.2f} :: {preview!r}"
-    )
-    return 0
+    return 1 if n_err else 0
 
 
 if __name__ == "__main__":

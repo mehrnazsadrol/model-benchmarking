@@ -1,0 +1,35 @@
+[
+  {
+    "_seed_note": "SEED EXAMPLES — replace/expand with your own real prompts. The leading underscore keys are ignored by the loader (only id/category/input/expected_output/scoring_method/scoring_args are read).",
+    "id": "instruction_following_001",
+    "category": "instruction_following",
+    "input": "Reply with exactly the single word 'ACKNOWLEDGED' and nothing else.",
+    "expected_output": "ACKNOWLEDGED",
+    "scoring_method": "exact_match",
+    "scoring_args": {}
+  },
+  {
+    "id": "instruction_following_002",
+    "category": "instruction_following",
+    "input": "Name the capital of France somewhere in your answer.",
+    "expected_output": "Paris",
+    "scoring_method": "contains",
+    "scoring_args": {}
+  },
+  {
+    "id": "instruction_following_003",
+    "category": "instruction_following",
+    "input": "Output a US ZIP code (exactly five digits) somewhere in your response, for example for the city of Beverly Hills.",
+    "expected_output": "\\b\\d{5}\\b",
+    "scoring_method": "regex",
+    "scoring_args": { "flags": [] }
+  },
+  {
+    "id": "instruction_following_004",
+    "category": "instruction_following",
+    "input": "Return a JSON object describing a person with the keys 'name' and 'age'. Respond with only the JSON.",
+    "expected_output": "{\"name\": \"...\", \"age\": 0}",
+    "scoring_method": "json_valid",
+    "scoring_args": { "required_keys": ["name", "age"] }
+  }
+]

@@ -1,25 +1,6 @@
-"""Sandbox verification — proves the DB layer + CLI plumbing work without network.
-
-This is NOT a replacement for the real Day 1 smoke test. The user still needs to
-run ``python run_benchmark.py --model qwen2.5_7b --prompt-id smoke_test`` with a
-live Hugging Face token to satisfy the Day 1 deliverable.
-
-What this script verifies:
-  1. ``runner.db.connect`` creates the schema in a fresh DB file.
-  2. ``upsert_model`` / ``upsert_prompt`` are idempotent and return stable ids.
-  3. ``run_exists`` correctly reports presence/absence.
-  4. ``insert_run`` round-trips every column (new schema: ttft_ms, no memory_mb).
-  5. The CLI's main() runs end-to-end when ``run_prompt`` is monkeypatched to
-     return a fake RunResult and a fake --token is supplied — i.e. argparse,
-     model/prompt resolution, the token check, DB writes, and the cached-skip
-     path all work without huggingface_hub or a network call.
-
-Run it from the repo root:
-    python scripts/verify_db.py
-"""
-
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import sys
@@ -30,6 +11,8 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 
 from runner import db as db_module
+from runner import prompts as prompts_module
+from runner import scorer as scorer_module
 import run_benchmark
 
 
@@ -40,7 +23,7 @@ def check(cond: bool, msg: str) -> None:
 
 
 def test_db_layer(tmp_db: str) -> None:
-    print("[1/2] DB layer")
+    print("[1/5] DB layer")
     with db_module.open_db(tmp_db) as conn:
         tables = {
             row["name"]
@@ -139,7 +122,7 @@ def test_db_layer(tmp_db: str) -> None:
 
 
 def test_cli_with_stub(tmp_db: str) -> None:
-    print("[2/2] CLI end-to-end (stubbed executor)")
+    print("[2/5] CLI end-to-end (stubbed executor)")
 
     def fake_run_prompt(hf_id, prompt_text, token, max_tokens=512, stream=True):
         return {
@@ -225,12 +208,295 @@ def test_cli_with_stub(tmp_db: str) -> None:
                 os.environ[k] = v
 
 
+def test_strip_reasoning() -> None:
+    print("[3/5] strip_reasoning (chain-of-thought stripping)")
+    strip = scorer_module.strip_reasoning
+
+    check(
+        strip("<think>let me ponder</think>42") == "42",
+        "balanced <think> block removed",
+    )
+    check(
+        strip("before <think>noise</think> after") == "before  after".strip()
+        or strip("before <think>noise</think> after") == "before  after",
+        "text around block preserved",
+    )
+    check(
+        strip("<think>multi\nline\nthought</think>\nFinal: 7") == "Final: 7",
+        "DOTALL multi-line block removed",
+    )
+    check(
+        strip("partial answer <think>unfinished reasoning with no close")
+        == "partial answer",
+        "unclosed <think> drops from opener onward",
+    )
+    check(
+        strip("<think>only an opener, truncated mid-thought") == "",
+        "unclosed opener with no prefix yields empty string",
+    )
+    check(strip("just a plain answer") == "just a plain answer", "plain text untouched")
+    check(strip("  spaced answer  ") == "spaced answer", "whitespace trimmed")
+    check(
+        strip("<THINK>upper</THINK>done") == "done", "tag matching is case-insensitive"
+    )
+
+
+def test_scoring_methods() -> None:
+    print("[4/5] scoring methods (pass + fail cases)")
+    s = scorer_module.score
+
+    em = {"scoring_method": "exact_match", "expected_output": "Hello World"}
+    check(s("  hello   world ", em) == 1.0, "exact_match: normalized match passes")
+    check(s("hello there", em) == 0.0, "exact_match: mismatch fails")
+    em_cs = {
+        "scoring_method": "exact_match",
+        "expected_output": "Yes",
+        "scoring_args": {"case_sensitive": True},
+    }
+    check(s("yes", em_cs) == 0.0, "exact_match: case_sensitive respected")
+
+    co = {"scoring_method": "contains", "expected_output": "Paris"}
+    check(
+        s("The capital is paris, of course.", co) == 1.0, "contains: substring passes"
+    )
+    check(s("The capital is Berlin.", co) == 0.0, "contains: absent fails")
+
+    rx = {"scoring_method": "regex", "expected_output": r"\b\d{5}\b"}
+    check(s("ZIP: 90210 here", rx) == 1.0, "regex: 5-digit match passes")
+    check(s("ZIP: 902 only", rx) == 0.0, "regex: no match fails")
+    rx_i = {
+        "scoring_method": "regex",
+        "expected_output": "yes",
+        "scoring_args": {"flags": "ignorecase"},
+    }
+    check(s("YES indeed", rx_i) == 1.0, "regex: ignorecase flag honored")
+    rx_bad = {"scoring_method": "regex", "expected_output": "([unclosed"}
+    check(
+        s("anything", rx_bad) == 0.0, "regex: malformed pattern returns 0.0, no raise"
+    )
+
+    nm = {"scoring_method": "numeric", "expected_output": "1234"}
+    check(
+        s("After summing, the total is 1,234.", nm) == 1.0,
+        "numeric: comma-grouped last number passes",
+    )
+    check(s("The answer is 99.", nm) == 0.0, "numeric: wrong number fails")
+    check(s("no digits here", nm) == 0.0, "numeric: no number returns 0.0")
+    nm_tol = {
+        "scoring_method": "numeric",
+        "expected_output": "40",
+        "scoring_args": {"tol": 0.5},
+    }
+    check(s("speed is 40.3 mph", nm_tol) == 1.0, "numeric: within tolerance passes")
+    check(s("speed is 41 mph", nm_tol) == 0.0, "numeric: outside tolerance fails")
+
+    jv = {"scoring_method": "json_valid", "expected_output": ""}
+    check(s('{"a": 1}', jv) == 1.0, "json_valid: clean JSON passes")
+    check(
+        s('Here is the result: {"a": 1}. Done.', jv) == 1.0,
+        "json_valid: JSON embedded in prose extracted",
+    )
+    check(s("not json at all", jv) == 0.0, "json_valid: non-JSON fails")
+    jv_keys = {
+        "scoring_method": "json_valid",
+        "expected_output": "",
+        "scoring_args": {"required_keys": ["name", "age"]},
+    }
+    check(
+        s('{"name": "A", "age": 5}', jv_keys) == 1.0,
+        "json_valid: required_keys present passes",
+    )
+    check(s('{"name": "A"}', jv_keys) == 0.0, "json_valid: missing required key fails")
+
+    try:
+        s("x", {"scoring_method": "bogus", "expected_output": ""})
+        raise AssertionError("expected ValueError on unknown scoring_method")
+    except ValueError:
+        print("  ok  unknown scoring_method raises ValueError")
+
+
+def test_load_prompts() -> None:
+    print("[5/5] load_prompts (seed files + duplicate rejection)")
+
+    seeds = prompts_module.load_prompts(os.path.join(ROOT, "prompts"))
+    check(len(seeds) >= 6, f"seed prompts loaded (got {len(seeds)})")
+    ids = {p["id"] for p in seeds}
+    check(len(ids) == len(seeds), "seed prompt ids are unique")
+    methods = {p["scoring_method"] for p in seeds}
+    check(
+        {"numeric", "exact_match", "contains", "regex", "json_valid"}.issubset(methods),
+        "seed prompts exercise all scoring methods",
+    )
+    check(
+        all(isinstance(p.get("scoring_args"), dict) for p in seeds),
+        "every loaded prompt has a dict scoring_args",
+    )
+
+    with tempfile.TemporaryDirectory() as tdir:
+        good = [
+            {
+                "id": "dup_1",
+                "category": "cat_a",
+                "input": "q",
+                "expected_output": "1",
+                "scoring_method": "numeric",
+            }
+        ]
+        dupe = [
+            {
+                "id": "dup_1",
+                "category": "cat_b",
+                "input": "q2",
+                "expected_output": "2",
+                "scoring_method": "numeric",
+            }
+        ]
+        with open(os.path.join(tdir, "cat_a.json"), "w", encoding="utf-8") as fh:
+            json.dump(good, fh)
+        with open(os.path.join(tdir, "cat_b.json"), "w", encoding="utf-8") as fh:
+            json.dump(dupe, fh)
+        try:
+            prompts_module.load_prompts(tdir)
+            raise AssertionError("expected PromptError on duplicate id")
+        except prompts_module.PromptError:
+            print("  ok  duplicate prompt id rejected")
+
+    with tempfile.TemporaryDirectory() as tdir:
+        bad = [
+            {
+                "id": "x_1",
+                "category": "wrong",
+                "input": "q",
+                "expected_output": "1",
+                "scoring_method": "numeric",
+            }
+        ]
+        with open(os.path.join(tdir, "right.json"), "w", encoding="utf-8") as fh:
+            json.dump(bad, fh)
+        try:
+            prompts_module.load_prompts(tdir)
+            raise AssertionError("expected PromptError on category/stem mismatch")
+        except prompts_module.PromptError:
+            print("  ok  category-vs-filename mismatch rejected")
+
+
+def test_suite_cli_with_stub(tmp_db: str) -> None:
+    print("[bonus] --suite CLI end-to-end (stubbed executor, scored rows)")
+
+    def _stub_answer(p: dict) -> str:
+        """Build a deterministically-correct answer for any prompt, wrapped in a
+        <think> block so reasoning-stripping is exercised before scoring. This is
+        derived from each prompt's scoring_method/expected_output so the test
+        stays valid no matter what prompts the suite files contain."""
+        method = p.get("scoring_method")
+        exp = p.get("expected_output", "")
+        args = p.get("scoring_args", {}) or {}
+        if method == "numeric":
+            body = f"The answer is {exp}."
+        elif method == "exact_match":
+            body = exp
+        elif method == "contains":
+            body = f"The answer is {exp}."
+        elif method == "regex":
+            # Satisfies common patterns; the seed regex is \b\d{5}\b.
+            body = "Example value: 12345 abcde."
+        elif method == "json_valid":
+            keys = args.get("required_keys") or ["ok"]
+            body = json.dumps({k: (0 if k == "age" else "x") for k in keys})
+        else:
+            body = exp
+        return f"<think>reasoning</think>{body}"
+
+    _by_input = {
+        p["input"]: p
+        for p in prompts_module.load_prompts(os.path.join(ROOT, "prompts"))
+    }
+
+    def fake_run_prompt(hf_id, prompt_text, token, max_tokens=512, stream=True):
+        p = _by_input.get(prompt_text)
+        reply = _stub_answer(p) if p else "fallback"
+        return {
+            "output": reply,
+            "latency_ms": 100,
+            "ttft_ms": 20,
+            "tokens_per_sec": 10.0,
+        }
+
+    saved = run_benchmark.run_prompt
+    run_benchmark.run_prompt = fake_run_prompt
+    try:
+        rc = run_benchmark.main(
+            [
+                "--model",
+                "qwen3_8b",
+                "--suite",
+                "--prompts-dir",
+                os.path.join(ROOT, "prompts"),
+                "--db-path",
+                tmp_db,
+                "--token",
+                "fake-token-for-verify",
+            ]
+        )
+    finally:
+        run_benchmark.run_prompt = saved
+    check(rc == 0, f"suite CLI exit code 0 (got {rc})")
+
+    n_seeds = len(prompts_module.load_prompts(os.path.join(ROOT, "prompts")))
+    with db_module.open_db(tmp_db) as conn:
+        rows = list(
+            conn.execute(
+                "SELECT prompt_id, output, quality_score FROM runs ORDER BY prompt_id"
+            )
+        )
+    check(len(rows) == n_seeds, f"one scored row per seed prompt (got {len(rows)})")
+    check(
+        all(r["quality_score"] is not None for r in rows),
+        "every suite row has a populated quality_score",
+    )
+    check(
+        all(r["quality_score"] == 1.0 for r in rows),
+        "tailored stub answers all score 1.0 (think-stripped before scoring)",
+    )
+    check(
+        all("<think>" in r["output"] for r in rows),
+        "RAW output (with <think>) stored in DB, not the cleaned copy",
+    )
+
+    run_benchmark.run_prompt = fake_run_prompt
+    try:
+        rc2 = run_benchmark.main(
+            [
+                "--model",
+                "qwen3_8b",
+                "--suite",
+                "--prompts-dir",
+                os.path.join(ROOT, "prompts"),
+                "--db-path",
+                tmp_db,
+                "--token",
+                "fake-token-for-verify",
+            ]
+        )
+    finally:
+        run_benchmark.run_prompt = saved
+    check(rc2 == 0, "suite re-run exits 0 (all cached)")
+    with db_module.open_db(tmp_db) as conn:
+        count = conn.execute("SELECT COUNT(*) AS c FROM runs").fetchone()["c"]
+    check(count == n_seeds, f"no duplicate rows on cached re-run (count={count})")
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmpdir:
         db1 = os.path.join(tmpdir, "layer.db")
         db2 = os.path.join(tmpdir, "cli.db")
+        db3 = os.path.join(tmpdir, "suite.db")
         test_db_layer(db1)
         test_cli_with_stub(db2)
+        test_strip_reasoning()
+        test_scoring_methods()
+        test_load_prompts()
+        test_suite_cli_with_stub(db3)
     print("\nAll verification checks passed.")
     print("Next step (with a live HF token exported):")
     print("  python run_benchmark.py --model qwen2.5_7b --prompt-id smoke_test")
