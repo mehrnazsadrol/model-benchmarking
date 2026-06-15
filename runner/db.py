@@ -156,3 +156,52 @@ def insert_run(
     )
     conn.commit()
     return int(cur.lastrowid)
+
+
+def upsert_run(
+    conn: sqlite3.Connection,
+    model_id: int,
+    prompt_id: str,
+    output: str,
+    latency_ms: int,
+    tokens_per_sec: float,
+    ts: int,
+    ttft_ms: Optional[int] = None,
+    quality_score: Optional[float] = None,
+) -> int:
+    conn.execute(
+        """
+        INSERT INTO runs (
+            model_id, prompt_id, output, quality_score,
+            latency_ms, ttft_ms, tokens_per_sec, ts
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(model_id, prompt_id) DO UPDATE SET
+            output = excluded.output,
+            quality_score = excluded.quality_score,
+            latency_ms = excluded.latency_ms,
+            ttft_ms = excluded.ttft_ms,
+            tokens_per_sec = excluded.tokens_per_sec,
+            ts = excluded.ts
+        """,
+        (
+            model_id,
+            prompt_id,
+            output,
+            quality_score,
+            latency_ms,
+            ttft_ms,
+            tokens_per_sec,
+            ts,
+        ),
+    )
+    conn.commit()
+
+    row = conn.execute(
+        "SELECT id FROM runs WHERE model_id = ? AND prompt_id = ?",
+        (model_id, prompt_id),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError(
+            f"Failed to upsert run for (model_id={model_id}, prompt_id={prompt_id!r})"
+        )
+    return int(row["id"])

@@ -53,7 +53,31 @@ Scaleway). Gated models require accepting the license on the model page first.
 > **Note:** Featherless AI is a subscription provider and does not work through
 > HF's routed pay-as-you-go billing, so models served only by Featherless (most
 > sub-7B models) are excluded. Qwen3 and DeepSeek-R1 are reasoning models that
-> may emit `<think>` blocks; these are stripped before scoring (see below).
+> may emit `<think>` blocks; these are stripped before scoring (see below). They
+> also carry a larger per-model token budget so the answer survives the
+> chain-of-thought — see [Token budget](#token-budget).
+
+### Token budget
+
+`--max-tokens` caps generated tokens per call. Reasoning models (`qwen3_8b`,
+`qwen3_14b`, `qwen3_32b`, `deepseek_r1_qwen_32b`) spend most of their budget on a
+`<think>` chain-of-thought before answering, so the default 512 is too small: the
+final answer never lands (empty `content`) or the `<think>` block is truncated
+unclosed and stripped to nothing. These models therefore carry a per-model
+`max_tokens` of **4096** in `BUILTIN_MODELS`; the others have no per-model budget
+and use the default **512**.
+
+The budget for each call is resolved by **precedence (highest first)**:
+
+1. An explicit `--max-tokens N` on the command line **overrides everything**, for
+   every selected model.
+2. Otherwise the model's per-model `max_tokens` (reasoning models → 4096).
+3. Otherwise the global default (512).
+
+The flag's argparse default is `None` (a sentinel), not the numeric default, so
+"was `--max-tokens` passed?" is unambiguous — an *unset* flag never silently
+clobbers a per-model budget. Raw `owner/repo` ids have no per-model budget and
+fall back to the CLI value or the default.
 
 ## Usage
 
@@ -83,6 +107,95 @@ python run_benchmark.py --model Qwen/Qwen2.5-7B-Instruct --prompt-id smoke_test
 `(model, prompt_id)`: a pair already in the database is skipped unless you pass
 `--force`. The built-in `smoke_test` prompt uses scoring method `"manual"` and
 is left unscored (`quality_score` NULL).
+
+## Running the full matrix
+
+To benchmark **many models over the whole suite** in one invocation, use the
+batch selectors instead of `--model`:
+
+| flag                | selects                                                        |
+| ------------------- | ------------------------------------------------------------- |
+| `--model KEY`       | a single model (Day 1/2 behavior; pairs with `--prompt-id` or `--suite`) |
+| `--models a,b,c`    | a comma-separated list of keys and/or raw `owner/repo` ids    |
+| `--all-models`      | every key in `BUILTIN_MODELS`                                  |
+
+`--model`, `--models`, and `--all-models` are **mutually exclusive**.
+`--models`/`--all-models` always run the **full prompt suite** (`--prompts-dir`,
+default `prompts/`) for each selected model — they are batch/suite-only, so
+combining them with `--prompt-id` or `--suite` is an error (reported, never
+silently ignored). `--prompt-id` is only valid with a single `--model`.
+
+```bash
+# Run a chosen subset (e.g. the 7 currently-licensed models):
+python run_benchmark.py --models \
+  qwen2.5_7b,qwen3_8b,qwen3_14b,gemma3_27b,qwen2.5_coder_32b,qwen3_32b,deepseek_r1_qwen_32b
+
+# Or run everything built in:
+python run_benchmark.py --all-models
+
+# Inspect the matrix:
+sqlite3 data/results.db \
+  "SELECT m.name, COUNT(*) AS runs, ROUND(AVG(r.quality_score),3) AS mean_score
+     FROM runs r JOIN models m ON m.id = r.model_id
+    GROUP BY m.name ORDER BY mean_score DESC"
+```
+
+The loop is **model → prompt**: for each selected model, every prompt in the
+suite runs (or is skipped if already cached), gets `<think>`-stripped, scored,
+and written. You get a per-model summary line and an overall summary at the end:
+
+```
+=== [model 1/7 qwen3_8b] Qwen/Qwen3-8B :: 204 prompts ===
+...
+[model qwen3_8b] 204 prompts: 200 ok, 4 cached, 0 errors, mean score 0.78
+...
+[done] matrix: 7 models x 204 prompts: 1396 ok, 28 cached, 4 errors, overall mean score 0.74
+```
+
+### Caching / resume
+
+Every cell is cached on `UNIQUE(model_id, prompt_id)`. Re-running the same
+command **resumes**: already-stored cells are skipped (counted as `cached`) and
+only missing cells are executed. A failed (errored) cell writes no row, so it is
+retried on the next run. This makes the matrix safe to interrupt and restart, and
+lets you add a model (or new prompts) later without recomputing what you have.
+Use `--force` to recompute and **cleanly overwrite** an already-cached cell: the
+forced re-run replaces the existing row for that `(model, prompt)` in place
+(`INSERT ... ON CONFLICT(model_id, prompt_id) DO UPDATE`), updating the output,
+score, metrics, and timestamp rather than erroring on the UNIQUE constraint. The
+non-`--force` path is unchanged: cached cells are skipped.
+
+### Retry / back-off policy
+
+Suite and batch runs wrap each inference call in bounded exponential back-off
+(`tenacity`: `wait_exponential(multiplier=2, min=2, max=20)`,
+`stop_after_attempt(3)` — so 1 try + up to 2 retries). One flaky cell never
+aborts the matrix: on final failure the cell is logged to stderr, counted as an
+error, and the loop continues.
+
+**Only transient failures are retried. Permanent ones fail fast:**
+
+| classified **transient** (retried)                       | classified **permanent** (no retry) |
+| -------------------------------------------------------- | ----------------------------------- |
+| HTTP 408 / 429 / 500 / 502 / 503 / 504 (and any other 5xx) | HTTP 400 (bad request)              |
+| timeouts and connection/protocol errors                  | 401 / 403 (gated / no permission)   |
+| "model is currently loading" cold-start messages         | 402 (billing / out of credits)      |
+|                                                          | 404 / 410 (model gone), 405         |
+
+Classification (`runner.retry.is_transient_error`) inspects the exception for an
+HTTP status code — `huggingface_hub.HfHubHTTPError` exposes
+`.response.status_code` — and decides by status. When no status is available it
+falls back to the exception type (timeouts/connection errors are transient) and
+otherwise treats the error as **permanent**, so we never silently loop on an
+unrecognized failure. Retrying 401/402/403/404/400 would just waste wall-clock
+time and, for 402, real inference credits. The single-prompt Day 1 path
+(`--model` + `--prompt-id`) runs with **no** retry (one attempt).
+
+### Cost / scale
+
+A full run is `N models × ~204 prompts` inference calls (e.g. 7 models ≈ 1,400
+calls). Each call is a pay-as-you-go request against an HF Inference Provider, so
+budget accordingly; caching means you only pay for cells you haven't run yet.
 
 ## Prompt suite format
 
@@ -161,9 +274,10 @@ model-benchmarking/
 │   ├── db.py               # SQLite schema + upsert helpers
 │   ├── executor.py         # HF InferenceClient wrapper + metrics
 │   ├── prompts.py          # prompt-suite loader + validation
+│   ├── retry.py            # transient-vs-permanent retry/back-off policy
 │   └── scorer.py           # rule-based scoring + <think> stripping
 ├── data/                   # SQLite DB lives here (gitignored)
-├── run_benchmark.py        # CLI entry point (single prompt or --suite)
+├── run_benchmark.py        # CLI entry point (single / --suite / --models / --all-models)
 ├── scripts/verify_db.py    # network-free verification harness
 ├── requirements.txt
 └── README.md
@@ -177,9 +291,13 @@ any environment without network access. It checks schema creation, idempotent
 upserts, `run_exists`, the full round-trip of the run columns, the
 `UNIQUE(model_id, prompt_id)` cached-skip behavior, the missing-token error path,
 `strip_reasoning`, every scoring method (a passing and a failing case each),
-`load_prompts` (including duplicate-id rejection), and the `--suite` path
-end-to-end. It does not replace a real run against the API; it only proves the
-persistence, scoring, and CLI layers work.
+`load_prompts` (including duplicate-id rejection), the `--suite` path
+end-to-end, the multi-model `--models`/`--all-models` matrix (one row per
+`(model, prompt)`, populated scores, raw `<think>` retained, fully-cached
+re-run), and the retry policy (a transient error is retried then succeeds; a
+permanent 403-style error fails fast, writes no row, and does not abort the
+batch). It does not replace a real run against the API; it only proves the
+persistence, scoring, retry, and CLI layers work.
 
 ```bash
 python scripts/verify_db.py

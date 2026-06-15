@@ -9,7 +9,7 @@ REQUIRED_FIELDS = ("id", "category", "input", "expected_output", "scoring_method
 
 
 class PromptError(ValueError):
-    """Raised when a prompt file is malformed or prompt ids collide."""
+    pass
 
 
 def _validate_prompt(obj: Any, source: str, stem: str) -> Dict[str, Any]:
