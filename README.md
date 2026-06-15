@@ -302,3 +302,68 @@ persistence, scoring, retry, and CLI layers work.
 ```bash
 python scripts/verify_db.py
 ```
+
+## Dashboard
+
+`app.py` is an interactive [Gradio](https://www.gradio.app) dashboard over the
+collected results in `data/results.db`. It is **read-only** and makes no network
+or inference calls — it only aggregates the local database. All numbers are
+scoped to the `reasoning` and `math` categories with `quality_score IS NOT NULL`
+(the saturated `instruction_following` / `smoke` rows are excluded). Throughput
+is an approximate metric (tok/s).
+
+Four views:
+
+- **Leaderboard** — one row per model: size, overall mean quality
+  (reasoning + math), per-category quality, average latency, and throughput,
+  sorted by overall quality.
+- **Latency vs quality** — one point per model (x = avg latency, log scale;
+  y = mean quality; point size = params), the headline trade-off chart.
+- **Per-category** — a grouped bar chart of mean quality per category by model.
+- **Head-to-head** — pick two models and a prompt to compare their raw stored
+  outputs and quality scores side by side.
+
+### Run locally
+
+```bash
+pip install -r requirements.txt
+python app.py
+```
+
+The DB path defaults to `data/results.db`; override it with the `RESULTS_DB_PATH`
+environment variable.
+
+Verify the data layer and figures offline (no server, no network):
+
+```bash
+python scripts/verify_dashboard.py
+```
+
+### Deploy to a Hugging Face Space
+
+A Gradio Space is just a repo whose `README.md` starts with a YAML front-matter
+header and whose `app_file` constructs and launches the demo. Add a header like
+this to the **Space's** README (not required for the local repo):
+
+```yaml
+---
+title: Model Benchmarking Dashboard
+emoji: 📊
+colorFrom: blue
+colorTo: indigo
+sdk: gradio
+app_file: app.py
+pinned: false
+---
+```
+
+Then push `app.py`, `requirements.txt`, and the `runner/` package to the Space.
+
+**Important:** `data/results.db` is **gitignored in this repo**, so it is not
+committed and will NOT be present on a fresh Space clone. The dashboard reads
+that file at runtime, so you must **upload `data/results.db` to the Space**
+yourself (commit it directly in the Space repo, or upload via the Space's Files
+tab / `huggingface_hub.upload_file`). Without the DB file present at
+`data/results.db` (or at `RESULTS_DB_PATH`), the Space will start but every view
+will be empty. Do not edit this repo's `.gitignore` to fix this — the DB is
+deliberately untracked here; the Space simply needs its own copy of the file.
